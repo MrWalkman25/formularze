@@ -352,15 +352,53 @@ POLISH_GOV_FORM_LABELS = {
 }
 
 def normalize_label_text(text: str) -> str:
-    text = text.strip().lower()
-    text = re.sub(r"^\d+[\.\)]\s*", "", text)
-    text = re.sub(r"^[a-zA-Z][\.\)]\s*", "", text)
+    text = text.lower().strip()
+
+    # Unifikacja typowych separatorів i dashy
+    text = text.replace("\u2013", "-").replace("\u2014", "-").replace("\u2212", "-")
+
+    # Ujednolicenia częstych wariantów
+    text = re.sub(r"\be[\-\s]?mail\b", "email", text)
+    text = re.sub(r"\bnr\.\b", "nr", text)
+    text = re.sub(r"\bnr(?=\s)", "nr", text)
+
+    # Usuwamy wiodące numeratory: 1., 2), a), (1), (a)
+    text = re.sub(r"^\(\s*(?:\d+|[a-z])\s*\)\s*", "", text)
+    text = re.sub(r"^(?:\d+|[a-z])[\.\)]\s*", "", text)
+
+    # Oczyszczanie końcowej interpunkcji
+    text = re.sub(r"[\s:;,.]+$", "", text)
     text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"[:;,\.]$", "", text)
     return text.strip()
 
-def get_field_type_hint(normalized: str) -> str:
+
+def _tokenize_label(text: str) -> list[str]:
+    if not text:
+        return []
+    return [t for t in re.split(r"[^\wąćęłńóśźż]+", text, flags=re.IGNORECASE) if t]
+
+
+def _build_alias_index() -> tuple[dict[str, list[tuple[str, str]]], dict[str, set[str]]]:
+    by_field = {}
+    by_type = {}
+
+    for field_id, aliases in POLISH_GOV_FORM_LABELS["semantic_aliases"].items():
+        normalized_aliases = []
+        for alias in aliases:
+            n_alias = normalize_label_text(alias)
+            normalized_aliases.append((alias, n_alias))
+        by_field[field_id] = normalized_aliases
+
     for ftype, labels in POLISH_GOV_FORM_LABELS["field_type_hints"].items():
+        by_type[ftype] = {normalize_label_text(label) for label in labels}
+
+    return by_field, by_type
+
+
+SEMANTIC_ALIAS_INDEX, FIELD_TYPE_HINT_INDEX = _build_alias_index()
+
+def get_field_type_hint(normalized: str) -> str:
+    for ftype, labels in FIELD_TYPE_HINT_INDEX.items():
         if normalized in labels:
             return ftype
     return "text"
@@ -371,62 +409,216 @@ def is_meta_instruction(normalized: str) -> bool:
             return True
     return False
 
-def get_semantic_field_id(normalized: str) -> str:
-    best_id = normalized
-    best_score = 0
-    
-    for f_id, aliases in POLISH_GOV_FORM_LABELS["semantic_aliases"].items():
-        for alias in aliases:
+def match_semantic_label(normalized: str) -> dict | None:
+    if not normalized:
+        return None
+
+    best = None
+    phrase_tokens = set(_tokenize_label(normalized))
+
+    for field_id, aliases in SEMANTIC_ALIAS_INDEX.items():
+        for raw_alias, alias in aliases:
+            strategy = None
+            score = 0.0
+
             if normalized == alias:
-                return f_id
-            
-            # Substring match
-            if alias in normalized:
-                if 80 > best_score:
-                    best_score = 80
-                    best_id = f_id
-                    
-            # Token overlap Jaccard
-            phrase_tokens = set(normalized.split())
-            alias_tokens = set(alias.split())
-            
-            if phrase_tokens and alias_tokens:
-                intersection = phrase_tokens.intersection(alias_tokens)
-                union = phrase_tokens.union(alias_tokens)
-                score = (len(intersection) / len(union)) * 100
-                if score > best_score and score >= 70:
-                    best_score = score
-                    best_id = f_id
-                    
-    return best_id
+                score = 100.0
+                strategy = "exact"
+            elif alias and alias in normalized:
+                score = 90.0
+                strategy = "contains"
+            elif normalized and normalized in alias:
+                score = 88.0
+                strategy = "reverse_contains"
+            else:
+                prefix_bonus = 0.0
+                if normalized.startswith(alias) or alias.startswith(normalized):
+                    prefix_bonus = 8.0
+                elif normalized.endswith(alias) or alias.endswith(normalized):
+                    prefix_bonus = 6.0
+
+                alias_tokens = set(_tokenize_label(alias))
+                if phrase_tokens and alias_tokens:
+                    intersection = phrase_tokens & alias_tokens
+                    union = phrase_tokens | alias_tokens
+                    if union:
+                        jaccard = len(intersection) / len(union)
+                        overlap = len(intersection) / max(1, min(len(phrase_tokens), len(alias_tokens)))
+                        score = max(jaccard * 100, overlap * 85) + prefix_bonus
+                        strategy = "token_overlap" if prefix_bonus == 0 else "prefix_overlap"
+
+            if strategy is None:
+                continue
+
+            # Wielopoziomowe progi akceptacji
+            accepted = False
+            if strategy == "exact":
+                accepted = True
+            elif strategy in {"contains", "reverse_contains"} and score >= 84:
+                accepted = True
+            elif strategy in {"prefix_overlap", "token_overlap"} and score >= 54:
+                accepted = True
+
+            if not accepted:
+                continue
+
+            if best is None or score > best["score"]:
+                best = {
+                    "field_id": field_id,
+                    "alias": raw_alias,
+                    "normalized_alias": alias,
+                    "score": round(score, 2),
+                    "strategy": strategy,
+                }
+
+    return best
+
+
+def _iter_line_ngrams(line: dict, max_n: int = 6):
+    words = line.get("words", [])
+    if not words:
+        return
+
+    total = len(words)
+    for start in range(total):
+        for n in range(1, max_n + 1):
+            end = start + n
+            if end > total:
+                break
+            group = words[start:end]
+            text = " ".join(w["text"] for w in group)
+            yield {
+                "x0": min(w["x0"] for w in group),
+                "y0": min(w["y0"] for w in group),
+                "x1": max(w["x1"] for w in group),
+                "y1": max(w["y1"] for w in group),
+                "text": text,
+                "words": group,
+                "source_line_text": line["text"],
+                "source": f"ngram_{n}",
+            }
+
+
+def _build_phrase_candidates(lines: list[dict]) -> list[dict]:
+    base_phrases = build_label_phrases(lines)
+    candidates = []
+    seen = set()
+
+    for phrase in base_phrases:
+        p = phrase.copy()
+        p["source"] = "phrase_builder"
+        candidates.append(p)
+
+    for line in lines:
+        # pełny tekst linii jako dodatkowy kandydat
+        line_candidate = {
+            "x0": line["x0"],
+            "y0": line["y0"],
+            "x1": line["x1"],
+            "y1": line["y1"],
+            "text": line["text"],
+            "words": line["words"],
+            "source_line_text": line["text"],
+            "source": "full_line",
+        }
+        candidates.append(line_candidate)
+        candidates.extend(_iter_line_ngrams(line, max_n=6))
+
+    deduped = []
+    for phrase in candidates:
+        n_text = normalize_label_text(phrase["text"])
+        key = (
+            n_text,
+            round(phrase["x0"], 1),
+            round(phrase["y0"], 1),
+            round(phrase["x1"], 1),
+            round(phrase["y1"], 1),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(phrase)
+
+    return deduped
 
 def _rects_overlap(r1: dict, r2: dict) -> bool:
     return not (r1["x1"] <= r2["x0"] or r1["x0"] >= r2["x1"] or 
                 r1["y1"] <= r2["y0"] or r1["y0"] >= r2["y1"])
 
+
+def _candidate_key(candidate: dict, page_index: int) -> tuple:
+    return (
+        page_index,
+        candidate["field_type"],
+        normalize_label_text(candidate["label"]),
+        round(candidate["x0"], 0),
+        round(candidate["y0"], 0),
+        round(candidate["x1"], 0),
+        round(candidate["y1"], 0),
+    )
+
+
+def _fallback_geometry_for_label(phrase: dict, field_type: str) -> tuple[float, float, float, float]:
+    px0, py0, px1, py1 = phrase["x0"], phrase["y0"], phrase["x1"], phrase["y1"]
+    label_h = max(8.0, py1 - py0)
+    label_w = max(20.0, px1 - px0)
+
+    if field_type == "checkbox":
+        size = max(14.0, label_h * 0.95)
+        return px1 + 6, py0 + (label_h - size) / 2, px1 + 6 + size, py0 + (label_h + size) / 2
+
+    if field_type == "date":
+        width = max(110.0, label_w * 1.8)
+        return px1 + 8, py0 - 1, px1 + 8 + width, py1 + 1
+
+    if field_type == "masked_text":
+        width = max(150.0, label_w * 2.2)
+        return px1 + 8, py0 - 1, px1 + 8 + width, py1 + 1
+
+    # text + multiline_text
+    width = max(140.0, label_w * 2.0)
+    height = label_h * (1.1 if field_type == "text" else 2.0)
+    return px1 + 8, py0 - 1, px1 + 8 + width, py0 - 1 + height
+
 def detect_field_candidates(words: list[dict], pdf_path: str = None, page_index: int = 0) -> list[dict]:
     from core.pdf_layout_parser import get_graphics, get_layout_lines, get_acroform_widgets
 
     candidates = []
+    seen_keys = set()
+    widget_rects = []
 
     # Krok 1: Próba pobrania natywnych pól z formularza AcroForm
     if pdf_path:
         widgets = get_acroform_widgets(pdf_path, page_index)
         if widgets:
             for w in widgets:
-                candidates.append({
+                widget_candidate = {
                     "x0": w["x0"],
                     "y0": w["y0"],
                     "x1": w["x1"],
                     "y1": w["y1"],
                     "label": w["field_name"],
                     "field_type": w["field_type"],
-                    "is_high_value": False
-                })
+                    "is_high_value": False,
+                    "page_index": page_index,
+                    "debug": {
+                        "source_text": w["field_name"],
+                        "normalized_text": normalize_label_text(w["field_name"]),
+                        "matched_field_id": w["field_name"],
+                        "matched_alias": None,
+                        "score": 100.0,
+                        "page_index": page_index,
+                        "matching_strategy": "acroform_widget",
+                        "candidate_source": "acroform_widget",
+                    },
+                }
+                candidates.append(widget_candidate)
+                seen_keys.add(_candidate_key(widget_candidate, page_index))
+                widget_rects.append(widget_candidate)
 
     # Krok 2: Fallback (Heurystyczny Rule-based Detector)
     lines = build_text_lines(words)
-    phrases = build_label_phrases(lines)
+    phrases = _build_phrase_candidates(lines)
     graphics = []
     h_lines = []
     v_lines = []
@@ -442,22 +634,11 @@ def detect_field_candidates(words: list[dict], pdf_path: str = None, page_index:
         if is_meta_instruction(normalized_phrase):
             continue
             
-        field_id = get_semantic_field_id(normalized_phrase)
-        
-        # Jeżeli field_id jest taki sam jak fraza (brak w słowniku), 
-        # i nie jest na liście np. address_parts, omijamy żeby nie łapać śmieci
-        # Ale dla MVP dopuszczamy wszystko z semantic_aliases i type hints
-        known = False
-        if field_id != normalized_phrase:
-            known = True
-            
-        # Szukamy też w hintach
-        field_type = get_field_type_hint(normalized_phrase)
-        if field_type != "text" or normalized_phrase in POLISH_GOV_FORM_LABELS["field_type_hints"]["text"]:
-            known = True
-            
-        if not known:
+        semantic_match = match_semantic_label(normalized_phrase)
+        if not semantic_match:
             continue
+        field_id = semantic_match["field_id"]
+        field_type = get_field_type_hint(semantic_match["normalized_alias"])
 
         px0, py0, px1, py1 = phrase["x0"], phrase["y0"], phrase["x1"], phrase["y1"]
         label_height = py1 - py0
@@ -466,6 +647,7 @@ def detect_field_candidates(words: list[dict], pdf_path: str = None, page_index:
         is_high_value = normalized_phrase in POLISH_GOV_FORM_LABELS["high_value_masked_fields"] or \
                         any(normalized_phrase in aliases for aliases in POLISH_GOV_FORM_LABELS["semantic_aliases"].values() if any(a in POLISH_GOV_FORM_LABELS["high_value_masked_fields"] for a in aliases))
 
+        geometry_strategy = "line_fallback"
         if field_type == "checkbox":
             nearest = find_nearest_rect(phrase, graphics)
             
@@ -474,24 +656,9 @@ def detect_field_candidates(words: list[dict], pdf_path: str = None, page_index:
                 candidate_y0 = nearest["y0"] - 1
                 candidate_x1 = nearest["x1"] + 1
                 candidate_y1 = nearest["y1"] + 1
+                geometry_strategy = "nearest_rect"
             else:
-                # Default heuristic for yes/no checkboxes
-                if normalized_phrase in ["tak", "nie"]:
-                    box_size = max(14, label_height * 0.9)
-                    candidate_x0 = px0 - box_size - 6
-                    candidate_y0 = py0 + (label_height - box_size) / 2
-                    candidate_x1 = candidate_x0 + box_size
-                    candidate_y1 = candidate_y0 + box_size
-                else:
-                    box_size = max(14, label_height * 0.9)
-                    if len(normalized_phrase) > 10:
-                        candidate_x0 = px0 + (label_width - box_size) / 2
-                        candidate_y0 = py1 + 4
-                    else:
-                        candidate_x0 = px1 + 8
-                        candidate_y0 = py0 + (label_height - box_size) / 2
-                    candidate_x1 = candidate_x0 + box_size
-                    candidate_y1 = candidate_y0 + box_size
+                candidate_x0, candidate_y0, candidate_x1, candidate_y1 = _fallback_geometry_for_label(phrase, field_type)
         else:
             left, top, right, bottom = find_cell_bounds_from_lines(phrase, h_lines, v_lines)
             
@@ -500,14 +667,13 @@ def detect_field_candidates(words: list[dict], pdf_path: str = None, page_index:
                 candidate_y0 = top + 2
                 candidate_x1 = right - 2
                 candidate_y1 = bottom - 2
+                geometry_strategy = "layout_cell"
                 
                 if candidate_x0 >= candidate_x1:
-                    candidate_x0 = left + 2
+                    candidate_x0, candidate_y0, candidate_x1, candidate_y1 = _fallback_geometry_for_label(phrase, field_type)
+                    geometry_strategy = "fallback_invalid_cell"
             else:
-                candidate_x0 = px1 + max(6, label_height * 0.4)
-                candidate_y0 = py0 - label_height * 0.1
-                candidate_x1 = candidate_x0 + max(120, label_width * 2.2)
-                candidate_y1 = py1 + label_height * 0.1
+                candidate_x0, candidate_y0, candidate_x1, candidate_y1 = _fallback_geometry_for_label(phrase, field_type)
 
         new_candidate = {
             "x0": candidate_x0,
@@ -516,19 +682,30 @@ def detect_field_candidates(words: list[dict], pdf_path: str = None, page_index:
             "y1": candidate_y1,
             "label": field_id,
             "field_type": field_type,
-            "is_high_value": is_high_value
+            "is_high_value": is_high_value,
+            "page_index": page_index,
+            "debug": {
+                "source_text": phrase["text"],
+                "normalized_text": normalized_phrase,
+                "matched_field_id": field_id,
+                "matched_alias": semantic_match["alias"],
+                "score": semantic_match["score"],
+                "page_index": page_index,
+                "matching_strategy": semantic_match["strategy"],
+                "candidate_source": phrase.get("source", "unknown"),
+                "geometry_strategy": geometry_strategy,
+            },
         }
-        
-        # Unikamy duplikowania z AcroForm widgets:
-        is_duplicate = False
-        for c in candidates:
-            # Check overlap logic
-            if _rects_overlap(new_candidate, c):
-                is_duplicate = True
-                break
-                
-        if not is_duplicate:
-            candidates.append(new_candidate)
+
+        # Priorytet dla natywnych widgetów AcroForm
+        if any(_rects_overlap(new_candidate, w) for w in widget_rects):
+            continue
+
+        c_key = _candidate_key(new_candidate, page_index)
+        if c_key in seen_keys:
+            continue
+        seen_keys.add(c_key)
+        candidates.append(new_candidate)
 
     return candidates
 
