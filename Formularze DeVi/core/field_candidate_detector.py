@@ -420,6 +420,7 @@ def match_semantic_label(normalized: str) -> dict | None:
         for raw_alias, alias in aliases:
             strategy = None
             score = 0.0
+            overlap_count = 0
 
             if normalized == alias:
                 score = 100.0
@@ -446,6 +447,11 @@ def match_semantic_label(normalized: str) -> dict | None:
                         overlap = len(intersection) / max(1, min(len(phrase_tokens), len(alias_tokens)))
                         score = max(jaccard * 100, overlap * 85) + prefix_bonus
                         strategy = "token_overlap" if prefix_bonus == 0 else "prefix_overlap"
+                        overlap_count = len(intersection)
+                    else:
+                        overlap_count = 0
+                else:
+                    overlap_count = 0
 
             if strategy is None:
                 continue
@@ -456,7 +462,9 @@ def match_semantic_label(normalized: str) -> dict | None:
                 accepted = True
             elif strategy in {"contains", "reverse_contains"} and score >= 84:
                 accepted = True
-            elif strategy in {"prefix_overlap", "token_overlap"} and score >= 54:
+            elif strategy == "prefix_overlap" and score >= 68 and overlap_count >= 1:
+                accepted = True
+            elif strategy == "token_overlap" and score >= 72 and overlap_count >= 2:
                 accepted = True
 
             if not accepted:
@@ -469,6 +477,7 @@ def match_semantic_label(normalized: str) -> dict | None:
                     "normalized_alias": alias,
                     "score": round(score, 2),
                     "strategy": strategy,
+                    "overlap_count": overlap_count,
                 }
 
     return best
@@ -580,6 +589,76 @@ def _fallback_geometry_for_label(phrase: dict, field_type: str) -> tuple[float, 
     height = label_h * (1.1 if field_type == "text" else 2.0)
     return px1 + 8, py0 - 1, px1 + 8 + width, py0 - 1 + height
 
+
+def _is_noise_match(phrase: dict, normalized_phrase: str, semantic_match: dict) -> bool:
+    source = phrase.get("source", "")
+    source_line = normalize_label_text(phrase.get("source_line_text", ""))
+    phrase_tokens = _tokenize_label(normalized_phrase)
+    alias_tokens = _tokenize_label(semantic_match["normalized_alias"])
+    line_tokens = _tokenize_label(source_line)
+    strategy = semantic_match.get("strategy")
+
+    # Długie zdania instrukcyjne + słaby overlap zwykle generują fałszywe pola.
+    if len(line_tokens) >= 10 and strategy in {"token_overlap", "prefix_overlap"}:
+        return True
+
+    # Jednowyrazowe n-gramy są zbyt szumne dla słabych strategii.
+    if source.startswith("ngram_1") and strategy != "exact":
+        return True
+
+    # Token overlap ma sens tylko gdy fragment nie jest dużo dłuższy od aliasu.
+    if strategy == "token_overlap" and len(phrase_tokens) > len(alias_tokens) + 3:
+        return True
+
+    return False
+
+
+def _rect_iou(r1: dict, r2: dict) -> float:
+    ix0 = max(r1["x0"], r2["x0"])
+    iy0 = max(r1["y0"], r2["y0"])
+    ix1 = min(r1["x1"], r2["x1"])
+    iy1 = min(r1["y1"], r2["y1"])
+    iw = max(0.0, ix1 - ix0)
+    ih = max(0.0, iy1 - iy0)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    a1 = (r1["x1"] - r1["x0"]) * (r1["y1"] - r1["y0"])
+    a2 = (r2["x1"] - r2["x0"]) * (r2["y1"] - r2["y0"])
+    return inter / max(1e-6, (a1 + a2 - inter))
+
+
+def _prune_overlapping_candidates(candidates: list[dict]) -> list[dict]:
+    widgets = [c for c in candidates if c.get("debug", {}).get("matching_strategy") == "acroform_widget"]
+    heuristics = [c for c in candidates if c not in widgets]
+
+    def rank_key(c: dict):
+        dbg = c.get("debug", {})
+        source = dbg.get("candidate_source", "")
+        source_rank = 0
+        if source == "phrase_builder":
+            source_rank = 3
+        elif source == "full_line":
+            source_rank = 2
+        elif source.startswith("ngram_"):
+            source_rank = 1
+        return (dbg.get("score", 0.0), source_rank)
+
+    kept = []
+    for cand in sorted(heuristics, key=rank_key, reverse=True):
+        suppress = False
+        for prev in kept:
+            same_page = cand.get("page_index") == prev.get("page_index")
+            same_type = cand["field_type"] == prev["field_type"]
+            same_label = cand["label"] == prev["label"]
+            if same_page and same_type and same_label and _rect_iou(cand, prev) >= 0.55:
+                suppress = True
+                break
+        if not suppress:
+            kept.append(cand)
+
+    return widgets + kept
+
 def detect_field_candidates(words: list[dict], pdf_path: str = None, page_index: int = 0) -> list[dict]:
     from core.pdf_layout_parser import get_graphics, get_layout_lines, get_acroform_widgets
 
@@ -636,6 +715,8 @@ def detect_field_candidates(words: list[dict], pdf_path: str = None, page_index:
             
         semantic_match = match_semantic_label(normalized_phrase)
         if not semantic_match:
+            continue
+        if _is_noise_match(phrase, normalized_phrase, semantic_match):
             continue
         field_id = semantic_match["field_id"]
         field_type = get_field_type_hint(semantic_match["normalized_alias"])
@@ -707,7 +788,7 @@ def detect_field_candidates(words: list[dict], pdf_path: str = None, page_index:
         seen_keys.add(c_key)
         candidates.append(new_candidate)
 
-    return candidates
+    return _prune_overlapping_candidates(candidates)
 
 def find_cell_bounds_from_lines(phrase: dict, h_lines: list[dict], v_lines: list[dict]) -> tuple[float, float, float, float]:
     px0, py0, px1, py1 = phrase["x0"], phrase["y0"], phrase["x1"], phrase["y1"]
